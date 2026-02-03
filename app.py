@@ -15,6 +15,20 @@ def traducir_iva(codigo):
     }
     return dict_iva.get(str(codigo), "Otros/No Grav.")
 
+
+def to_num(x):
+    if x is None:
+        return 0.0
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    s = s.replace(".", "").replace(",", ".")  # 1.234,56 -> 1234.56
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+
 def limpiar_adenda(texto_sucio):
     if not texto_sucio: return ""
     texto_claro = html.unescape(texto_sucio)
@@ -27,6 +41,14 @@ def buscar_dato(nodo, nombre_tag):
         if tag_name == nombre_tag:
             return elem.text.strip() if elem.text else ""
     return ""
+def item_dict(item):
+    d = {}
+    for sub in item.iter():
+        k = sub.tag.split('}')[-1]
+        if k not in d:
+            d[k] = (sub.text or "").strip()
+    return d
+
 
 def procesar_contenido_xml(contenido, nombre_archivo):
     try:
@@ -42,22 +64,23 @@ def procesar_contenido_xml(contenido, nombre_archivo):
         tipo_cfe = buscar_dato(root, "TipoCFE")
         adenda_raw = buscar_dato(root, "Adenda")
         adenda_final = limpiar_adenda(adenda_raw)
+        
 
         items = [e for e in root.iter() if e.tag.split('}')[-1] == "Item"]
         lineas_archivo = []
         
         for item in items:
-            def val_i(t):
-                for sub in item.iter():
-                    if sub.tag.split('}')[-1] == t:
-                        return sub.text.strip() if sub.text else ""
-                return ""
+            it = item_dict(item)
+            cod_iva = it.get("IndFact", "")
+            neto = to_num(it.get("MontoItem"))
+            iva_monto = to_num(it.get("IVAMonto"))
+            cant = to_num(it.get("Cantidad"))
+            precio = to_num(it.get("PrecioUnitario"))
 
-            cod_iva = val_i("IndFact")
-            neto = float(val_i("MontoItem") or 0)
-            iva_monto = float(val_i("IVAMonto") or 0)
+            doc_key = f"{rut_e}|{rut_r}|{serie}|{nro}|{fch_e}|{tipo_cfe}"
 
             lineas_archivo.append({
+                "DocKey": doc_key,
                 "Archivo": nombre_archivo,
                 "RUT Emisor": rut_e,
                 "Razón Social": rzn_e,
@@ -68,8 +91,8 @@ def procesar_contenido_xml(contenido, nombre_archivo):
                 "Moneda": moneda,
                 "Línea": val_i("NroLinDet"),
                 "Descripción": val_i("NomItem"),
-                "Cant.": float(val_i("Cantidad") or 0),
-                "Precio Unit.": float(val_i("PrecioUnitario") or 0),
+                "Cant.": cant,
+                "Precio Unit.": precio,
                 "Cod. IVA": cod_iva,
                 "Tasa IVA": traducir_iva(cod_iva),
                 "Neto": neto,
@@ -91,6 +114,8 @@ archivo_zip = st.file_uploader("Seleccioná el archivo .ZIP", type=["zip"])
 
 if archivo_zip:
     total_data = []
+    ok = 0
+    vacios_o_fallidos = 0
     
     with zipfile.ZipFile(archivo_zip, 'r') as z:
         archivos_xml = [f for f in z.namelist() if f.lower().endswith(".xml")]
@@ -99,7 +124,12 @@ if archivo_zip:
             with z.open(nombre_arc) as f:
                 contenido = f.read()
                 res = procesar_contenido_xml(contenido, nombre_arc)
+
+            if res:
+                ok += 1
                 total_data.extend(res)
+            else:
+                vacios_o_fallidos += 1
 
     if total_data:
         df = pd.DataFrame(total_data)
@@ -118,7 +148,10 @@ if archivo_zip:
         df = df.drop(columns=['Fch_DT'])
 
         # Mostrar vista previa
-        st.success(f"Se procesaron {len(archivos_xml)} archivos correctamente.")
+        st.success(f"Archivos con líneas: {ok} / {len(archivos_xml)}")
+        if vacios_o_fallidos:
+        st.warning(f"{vacios_o_fallidos} XML no generaron líneas (vacíos o formato inesperado).")
+
         st.dataframe(df.head())
 
         # Botón de descarga
@@ -133,4 +166,5 @@ if archivo_zip:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
+
         st.error("No se encontraron datos válidos dentro de los XML.")

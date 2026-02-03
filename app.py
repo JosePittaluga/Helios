@@ -6,7 +6,7 @@ import html
 import re
 from io import BytesIO
 
-# --- FUNCIONES DE LÓGICA (Tus funciones originales adaptadas) ---
+# --- FUNCIONES DE LÓGICA ---
 
 def traducir_iva(codigo):
     dict_iva = {
@@ -15,19 +15,16 @@ def traducir_iva(codigo):
     }
     return dict_iva.get(str(codigo), "Otros/No Grav.")
 
-
 def to_num(x):
-    if x is None:
-        return 0.0
+    if x is None: return 0.0
     s = str(x).strip()
-    if s == "":
-        return 0.0
-    s = s.replace(".", "").replace(",", ".")  # 1.234,56 -> 1234.56
+    if s == "": return 0.0
+    # Limpieza de formatos europeos/latinos
+    s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
     except:
         return 0.0
-
 
 def limpiar_adenda(texto_sucio):
     if not texto_sucio: return ""
@@ -41,18 +38,20 @@ def buscar_dato(nodo, nombre_tag):
         if tag_name == nombre_tag:
             return elem.text.strip() if elem.text else ""
     return ""
-def item_dict(item):
-    d = {}
-    for sub in item.iter():
-        k = sub.tag.split('}')[-1]
-        if k not in d:
-            d[k] = (sub.text or "").strip()
-    return d
 
+def extraer_items(item_nodo):
+    """Extrae todos los sub-elementos de un Item a un diccionario plano"""
+    d = {}
+    for sub in item_nodo.iter():
+        k = sub.tag.split('}')[-1]
+        d[k] = (sub.text or "").strip()
+    return d
 
 def procesar_contenido_xml(contenido, nombre_archivo):
     try:
         root = ET.fromstring(contenido)
+        
+        # Datos de cabecera
         rut_e = buscar_dato(root, "RUCEmisor")
         rzn_e = buscar_dato(root, "RznSoc")
         rut_r = buscar_dato(root, "DocRecep")
@@ -64,23 +63,23 @@ def procesar_contenido_xml(contenido, nombre_archivo):
         tipo_cfe = buscar_dato(root, "TipoCFE")
         adenda_raw = buscar_dato(root, "Adenda")
         adenda_final = limpiar_adenda(adenda_raw)
-        
 
-        items = [e for e in root.iter() if e.tag.split('}')[-1] == "Item"]
+        # Buscar todos los nodos <Item>
+        items_nodos = [e for e in root.iter() if e.tag.split('}')[-1] == "Item"]
         lineas_archivo = []
         
-        for item in items:
-            it = item_dict(item)
+        for nodo in items_nodos:
+            it = extraer_items(nodo)
+            
             cod_iva = it.get("IndFact", "")
             neto = to_num(it.get("MontoItem"))
             iva_monto = to_num(it.get("IVAMonto"))
             cant = to_num(it.get("Cantidad"))
             precio = to_num(it.get("PrecioUnitario"))
-
-            doc_key = f"{rut_e}|{rut_r}|{serie}|{nro}|{fch_e}|{tipo_cfe}"
+            desc = it.get("NomItem", "")
+            nro_lin = it.get("NroLinDet", "")
 
             lineas_archivo.append({
-                "DocKey": doc_key,
                 "Archivo": nombre_archivo,
                 "RUT Emisor": rut_e,
                 "Razón Social": rzn_e,
@@ -89,8 +88,8 @@ def procesar_contenido_xml(contenido, nombre_archivo):
                 "Fch Emisión": fch_e,
                 "Fch Vencimiento": fch_v,
                 "Moneda": moneda,
-                "Línea": val_i("NroLinDet"),
-                "Descripción": val_i("NomItem"),
+                "Línea": nro_lin,
+                "Descripción": desc,
                 "Cant.": cant,
                 "Precio Unit.": precio,
                 "Cod. IVA": cod_iva,
@@ -108,56 +107,54 @@ def procesar_contenido_xml(contenido, nombre_archivo):
 # --- INTERFAZ STREAMLIT ---
 
 st.title("🛡️ Helios XML Extractor")
-st.write("Subí un archivo ZIP con XMLs para generar el Excel consolidado.")
+st.write("Subí un archivo ZIP para consolidar tus CFE en Excel.")
 
 archivo_zip = st.file_uploader("Seleccioná el archivo .ZIP", type=["zip"])
 
 if archivo_zip:
     total_data = []
-    ok = 0
-    vacios_o_fallidos = 0
+    ok_count = 0
     
     with zipfile.ZipFile(archivo_zip, 'r') as z:
+        # Buscamos XMLs en todas las carpetas
         archivos_xml = [f for f in z.namelist() if f.lower().endswith(".xml")]
         
-        for nombre_arc in archivos_xml:
-            with z.open(nombre_arc) as f:
-                contenido = f.read()
-                res = procesar_contenido_xml(contenido, nombre_arc)
-
-            if res:
-                ok += 1
-                total_data.extend(res)
-            else:
-                vacios_o_fallidos += 1
+        if not archivos_xml:
+            st.error("No se encontraron archivos XML dentro del ZIP.")
+        else:
+            for nombre_arc in archivos_xml:
+                with z.open(nombre_arc) as f:
+                    contenido = f.read()
+                    res = procesar_contenido_xml(contenido, nombre_arc)
+                    if res:
+                        total_data.extend(res)
+                        ok_count += 1
 
     if total_data:
         df = pd.DataFrame(total_data)
         
-        # Lógica de nombre dinámico (RUT y Fechas)
+        # Nombre dinámico
         rut_receptor = df["RUT Receptor"].dropna().unique()
         rut_str = str(rut_receptor[0]) if len(rut_receptor) > 0 else "SIN_RUT"
         
         df['Fch_DT'] = pd.to_datetime(df['Fch Emisión'], errors='coerce')
-        fecha_min = df['Fch_DT'].min()
-        fecha_max = df['Fch_DT'].max()
-        fmin_str = fecha_min.strftime('%m%Y') if pd.notnull(fecha_min) else "XXXX"
-        fmax_str = fecha_max.strftime('%m%Y') if pd.notnull(fecha_max) else "XXXX"
-        
-        nombre_sugerido = f"ReporteXML_{rut_str}_{fmin_str}_{fmax_str}.xlsx"
+        fmin = df['Fch_DT'].min().strftime('%m%Y') if pd.notnull(df['Fch_DT'].min()) else "ini"
+        fmax = df['Fch_DT'].max().strftime('%m%Y') if pd.notnull(df['Fch_DT'].max()) else "fin"
+        nombre_sugerido = f"ReporteXML_{rut_str}_{fmin}_{fmax}.xlsx"
         df = df.drop(columns=['Fch_DT'])
 
-        # Mostrar vista previa
-        st.success(f"Archivos con líneas: {ok} / {len(archivos_xml)}")
-        if vacios_o_fallidos:
-            st.warning(f"{vacios_o_fallidos} XML no generaron líneas (vacíos o formato inesperado).")
-
+        st.success(f"Se procesaron {ok_count} archivos XML correctamente.")
         st.dataframe(df.head())
 
-        # Botón de descarga
+        # Botón de descarga con engine compatible
         output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False)
+        # Usamos xlsxwriter si está instalado, sino openpyxl
+        try:
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False)
+        except:
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False)
         
         st.download_button(
             label="📥 Descargar Reporte Excel",
@@ -166,6 +163,4 @@ if archivo_zip:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-
-        st.error("No se encontraron datos válidos dentro de los XML.")
-
+        st.error("No se pudo extraer información válida de los XML.")

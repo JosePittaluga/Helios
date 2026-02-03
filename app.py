@@ -150,7 +150,7 @@ if archivo_zip:
         # Mostrar vista previa
         st.success(f"Archivos con líneas: {ok} / {len(archivos_xml)}")
         if vacios_o_fallidos:
-        st.warning(f"{vacios_o_fallidos} XML no generaron líneas (vacíos o formato inesperado).")
+            st.warning(f"{vacios_o_fallidos} XML no generaron líneas (vacíos o formato inesperado).")
 
         st.dataframe(df.head())
 
@@ -168,3 +168,4 @@ if archivo_zip:
     else:
 
         st.error("No se encontraron datos válidos dentro de los XML.")
+

@@ -64,6 +64,57 @@ def get_company_tipo_contabilidad_by_vat(vat: str) -> str:
         return val[1] or ""
     return val or ""
 
+@lru_cache(maxsize=2048)
+def get_company_id_by_vat(vat: str) -> int | None:
+    vat = (vat or "").strip()
+    if not vat:
+        return None
+    uid, models = odoo_clients()
+    ids = models.execute_kw(
+        DB, uid, PASS,
+        "res.company", "search",
+        [[("vat", "=", vat)]],
+        {"limit": 1}
+    )
+    return ids[0] if ids else None
+
+
+@lru_cache(maxsize=256)
+def get_chart_of_accounts(company_id: int) -> list[tuple[str, str]]:
+    """
+    Devuelve lista de tuplas: (display, code)
+    display = 'CODE - Name'
+    """
+    if not company_id:
+        return []
+
+    uid, models = odoo_clients()
+
+    # Traemos cuentas NO deprecated (si tu Odoo usa ese flag)
+    # En algunos setups puede llamarse 'deprecated' (estándar), en otros no.
+    domain = [[("company_id", "=", company_id)]]
+
+    recs = models.execute_kw(
+        DB, uid, PASS,
+        "account.account", "search_read",
+        domain,
+        {"fields": ["code", "name", "deprecated"], "limit": 5000}
+    )
+
+    # Filtrar deprecated si el campo vino
+    out = []
+    for r in recs:
+        if "deprecated" in r and r["deprecated"]:
+            continue
+        code = (r.get("code") or "").strip()
+        name = (r.get("name") or "").strip()
+        if not code and not name:
+            continue
+        out.append((f"{code} - {name}".strip(" -"), code))
+
+    # ordenar por code
+    out.sort(key=lambda x: x[1] or "")
+    return out
 
 # ----------------------------
 # FUNCIONES DE LÓGICA
@@ -279,6 +330,36 @@ if archivo_zip:
         )
 
         st.dataframe(df.head())
+        # --- UI: seleccionar company y mostrar plan de cuentas ---
+        companies = (
+            df["RUT Company (según carpeta)"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        companies = [c for c in companies.unique().tolist() if c]
+
+        if companies:
+            st.subheader("Plan de cuentas (prueba)")
+            rut_company_sel = st.selectbox("Elegí la empresa (RUT) detectada", companies)
+
+            company_id = get_company_id_by_vat(rut_company_sel)
+            if not company_id:
+                st.warning("No encontré la company en Odoo para ese RUT (res.company.vat).")
+            else:
+                cuentas = get_chart_of_accounts(company_id)
+                if not cuentas:
+                    st.warning("No pude traer cuentas (o no hay cuentas) para esa company.")
+            else:
+                opciones = [d for d, _code in cuentas]
+                cuenta_sel = st.selectbox("Elegí una cuenta del plan", opciones)
+
+            # Si querés ver el code seleccionado:
+                code_sel = cuenta_sel.split(" - ")[0].strip() if " - " in cuenta_sel else cuenta_sel
+                st.caption(f"Seleccionaste: {cuenta_sel}  |  code: {code_sel}  |  company_id: {company_id}")
+        else:
+            st.info("No se detectaron RUT company en los XML (tipo_doc desconocido o falta RUT).")
+
 
         # Export Excel
         output = BytesIO()
@@ -297,3 +378,4 @@ if archivo_zip:
         )
     else:
         st.error("No se pudo extraer información válida de los XML.")
+

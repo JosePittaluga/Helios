@@ -16,15 +16,25 @@ def traducir_iva(codigo):
     return dict_iva.get(str(codigo), "Otros/No Grav.")
 
 def to_num(x):
-    if x is None: return 0.0
+    if x is None:
+        return 0.0
     s = str(x).strip()
-    if s == "": return 0.0
-    # Limpieza de formatos europeos/latinos
-    s = s.replace(".", "").replace(",", ".")
+    if s == "":
+        return 0.0
+
+    # Caso 1: tiene coma -> coma decimal (formato LATAM/Europa)
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    # Caso 2: no tiene coma -> asumimos punto decimal o entero normal
+    else:
+        # dejá el punto como decimal, solo limpiá espacios
+        pass
+
     try:
         return float(s)
     except:
         return 0.0
+
 
 def limpiar_adenda(texto_sucio):
     if not texto_sucio: return ""
@@ -164,3 +174,4 @@ if archivo_zip:
         )
     else:
         st.error("No se pudo extraer información válida de los XML.")
+

@@ -350,9 +350,9 @@ if archivo_zip:
                 cuentas = get_chart_of_accounts(company_id)
                 if not cuentas:
                     st.warning("No pude traer cuentas (o no hay cuentas) para esa company.")
-            else:
-                opciones = [d for d, _code in cuentas]
-                cuenta_sel = st.selectbox("Elegí una cuenta del plan", opciones)
+                else:
+                    opciones = [d for d, _code in cuentas]
+                    cuenta_sel = st.selectbox("Elegí una cuenta del plan", opciones)
 
             # Si querés ver el code seleccionado:
                 code_sel = cuenta_sel.split(" - ")[0].strip() if " - " in cuenta_sel else cuenta_sel
@@ -378,4 +378,5 @@ if archivo_zip:
         )
     else:
         st.error("No se pudo extraer información válida de los XML.")
+
 

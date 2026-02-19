@@ -9,20 +9,17 @@ import xmlrpc.client
 from functools import lru_cache
 
 # ----------------------------
+# CONFIGURACIÓN DE PÁGINA
+# ----------------------------
+st.set_page_config(page_title="Helios XML Extractor", layout="wide")
+
+# ----------------------------
 # ODOO (via st.secrets)
 # ----------------------------
-# En Streamlit Cloud: Settings -> Secrets
-# [odoo]
-# url = "https://xxxx"
-# db = "xxxx"
-# user = "xxxx"
-# password = "xxxx"
-
 ODOO_URL = st.secrets["odoo"]["url"]
 DB = st.secrets["odoo"]["db"]
 USER = st.secrets["odoo"]["user"]
 PASS = st.secrets["odoo"]["password"]
-
 
 @lru_cache(maxsize=1)
 def odoo_clients():
@@ -33,350 +30,178 @@ def odoo_clients():
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
 
-
 @lru_cache(maxsize=2048)
 def get_company_tipo_contabilidad_by_vat(vat: str) -> str:
     vat = (vat or "").strip()
-    if not vat:
-        return ""
-
+    if not vat: return ""
     uid, models = odoo_clients()
-
-    ids = models.execute_kw(
-        DB, uid, PASS,
-        "res.company", "search",
-        [[("vat", "=", vat)]],
-        {"limit": 1}
-    )
-    if not ids:
-        return ""
-
-    rec = models.execute_kw(
-        DB, uid, PASS,
-        "res.company", "read",
-        [ids],
-        {"fields": ["x_studio_tipo_contabilidad"]}
-    )
+    ids = models.execute_kw(DB, uid, PASS, "res.company", "search", [[("vat", "=", vat)]], {"limit": 1})
+    if not ids: return ""
+    rec = models.execute_kw(DB, uid, PASS, "res.company", "read", [ids], {"fields": ["x_studio_tipo_contabilidad"]})
     val = rec[0].get("x_studio_tipo_contabilidad")
-
-    # Por las dudas (si fuera many2one)
-    if isinstance(val, list) and len(val) == 2:
-        return val[1] or ""
+    if isinstance(val, list) and len(val) == 2: return val[1] or ""
     return val or ""
 
 @lru_cache(maxsize=2048)
 def get_company_id_by_vat(vat: str) -> int | None:
     vat = (vat or "").strip()
-    if not vat:
-        return None
+    if not vat: return None
     uid, models = odoo_clients()
-    ids = models.execute_kw(
-        DB, uid, PASS,
-        "res.company", "search",
-        [[("vat", "=", vat)]],
-        {"limit": 1}
-    )
+    ids = models.execute_kw(DB, uid, PASS, "res.company", "search", [[("vat", "=", vat)]], {"limit": 1})
     return ids[0] if ids else None
-
 
 @lru_cache(maxsize=256)
 def get_chart_of_accounts(company_id: int) -> list[tuple[str, str]]:
-    """
-    Devuelve lista de tuplas: (display, code)
-    display = 'CODE - Name'
-    """
-    if not company_id:
-        return []
-
+    if not company_id: return []
     uid, models = odoo_clients()
-
-    # Traemos cuentas NO deprecated (si tu Odoo usa ese flag)
-    # En algunos setups puede llamarse 'deprecated' (estándar), en otros no.
     domain = [[("company_id", "=", company_id)]]
-
-    recs = models.execute_kw(
-        DB, uid, PASS,
-        "account.account", "search_read",
-        domain,
-        {"fields": ["code", "name", "deprecated"], "limit": 5000}
-    )
-
-    # Filtrar deprecated si el campo vino
+    recs = models.execute_kw(DB, uid, PASS, "account.account", "search_read", domain, {"fields": ["code", "name", "deprecated"], "limit": 5000})
     out = []
     for r in recs:
-        if "deprecated" in r and r["deprecated"]:
-            continue
-        code = (r.get("code") or "").strip()
-        name = (r.get("name") or "").strip()
-        if not code and not name:
-            continue
-        out.append((f"{code} - {name}".strip(" -"), code))
-
-    # ordenar por code
+        if r.get("deprecated"): continue
+        code, name = (r.get("code") or "").strip(), (r.get("name") or "").strip()
+        if code or name: out.append((f"{code} - {name}".strip(" -"), code))
     out.sort(key=lambda x: x[1] or "")
     return out
 
-# ----------------------------
-# FUNCIONES DE LÓGICA
-# ----------------------------
+@lru_cache(maxsize=128)
+def get_odoo_partners(company_id: int) -> set:
+    """Trae todos los nombres de contactos (proveedores/clientes) de esa compañía o globales."""
+    if not company_id: return set()
+    uid, models = odoo_clients()
+    # Buscamos partners de la compañía o compartidos (company_id = False)
+    domain = ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
+    partners = models.execute_kw(DB, uid, PASS, "res.partner", "search_read", [domain], {"fields": ["name"]})
+    return {str(p["name"]).strip().lower() for p in partners if p.get("name")}
 
+# ----------------------------
+# FUNCIONES DE LÓGICA XML
+# ----------------------------
 def traducir_iva(codigo):
-    dict_iva = {
-        "1": "Exento", "2": "Tasa Mínima (10%)", "3": "Tasa Básica (22%)",
-        "4": "Exportación", "10": "Exportación Servicios"
-    }
+    dict_iva = {"1": "Exento", "2": "Tasa Mínima (10%)", "3": "Tasa Básica (22%)", "4": "Exportación", "10": "Exportación Servicios"}
     return dict_iva.get(str(codigo), "Otros/No Grav.")
 
-
 def to_num(x):
-    if x is None:
-        return 0.0
+    if x is None: return 0.0
     s = str(x).strip()
-    if s == "":
-        return 0.0
-
-    # Si tiene coma, asumimos coma decimal (LATAM/Europa): 1.234,56
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    # Si no tiene coma, dejamos el punto como decimal si existe: 22.50
-    try:
-        return float(s)
-    except:
-        return 0.0
-
+    if not s: return 0.0
+    if "," in s: s = s.replace(".", "").replace(",", ".")
+    try: return float(s)
+    except: return 0.0
 
 def limpiar_adenda(texto_sucio):
-    if not texto_sucio:
-        return ""
+    if not texto_sucio: return ""
     texto_claro = html.unescape(texto_sucio)
-    texto_limpio = re.sub(r"<[^>]+>", " ", texto_claro)
-    return " ".join(texto_limpio.split())
-
+    return " ".join(re.sub(r"<[^>]+>", " ", texto_claro).split())
 
 def buscar_dato(nodo, nombre_tag):
     for elem in nodo.iter():
-        tag_name = elem.tag.split("}")[-1]
-        if tag_name == nombre_tag:
-            return elem.text.strip() if elem.text else ""
+        if elem.tag.split("}")[-1] == nombre_tag: return elem.text.strip() if elem.text else ""
     return ""
 
-
 def extraer_items(item_nodo):
-    """Extrae sub-elementos de un Item a dict; se queda con la primera ocurrencia de cada tag."""
     d = {}
     for sub in item_nodo.iter():
         k = sub.tag.split("}")[-1]
-        if k not in d:
-            d[k] = (sub.text or "").strip()
+        if k not in d: d[k] = (sub.text or "").strip()
     return d
 
-
 def detectar_tipo_por_ruta(nombre_archivo: str) -> str:
-    """
-    Detecta si el XML es de recibidos o emitidos usando la ruta dentro del ZIP.
-    Ajustá keywords si tus carpetas tienen otros nombres.
-    """
     p = (nombre_archivo or "").lower()
-    if "recib" in p:
-        return "recibido"
-    if "emit" in p:
-        return "emitido"
+    if "recib" in p: return "recibido"
+    if "emit" in p: return "emitido"
     return "desconocido"
-
 
 def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
     try:
         root = ET.fromstring(contenido)
+        rut_e, rzn_e = buscar_dato(root, "RUCEmisor"), buscar_dato(root, "RznSoc")
+        rut_r, serie, nro = buscar_dato(root, "DocRecep"), buscar_dato(root, "Serie"), buscar_dato(root, "Nro")
+        fch_e, fch_v, moneda = buscar_dato(root, "FchEmis"), buscar_dato(root, "FchVenc"), buscar_dato(root, "TpoMoneda")
+        tipo_cfe, adenda_final = buscar_dato(root, "TipoCFE"), limpiar_adenda(buscar_dato(root, "Adenda"))
 
-        # Cabecera
-        rut_e = buscar_dato(root, "RUCEmisor")
-        rzn_e = buscar_dato(root, "RznSoc")
-        rut_r = buscar_dato(root, "DocRecep")
-        serie = buscar_dato(root, "Serie")
-        nro = buscar_dato(root, "Nro")
-        fch_e = buscar_dato(root, "FchEmis")
-        fch_v = buscar_dato(root, "FchVenc")
-        moneda = buscar_dato(root, "TpoMoneda")
-        tipo_cfe = buscar_dato(root, "TipoCFE")
-        adenda_raw = buscar_dato(root, "Adenda")
-        adenda_final = limpiar_adenda(adenda_raw)
+        rut_company = rut_r if tipo_doc == "recibido" else (rut_e if tipo_doc == "emitido" else "")
+        tipo_contab = get_company_tipo_contabilidad_by_vat(rut_company) if rut_company else ""
 
-        # Según carpeta: quién es "la empresa"
-        rut_company = ""
-        if tipo_doc == "recibido":
-            rut_company = rut_r
-        elif tipo_doc == "emitido":
-            rut_company = rut_e
-
-        # Lookup en Odoo: res.company.vat -> x_studio_tipo_contabilidad
-        tipo_contab = ""
-        if rut_company:
-            tipo_contab = get_company_tipo_contabilidad_by_vat(rut_company)
-
-        # Items
         items_nodos = [e for e in root.iter() if e.tag.split("}")[-1] == "Item"]
-        if not items_nodos:
-            return []
-
-        lineas_archivo = []
+        lineas = []
         for nodo in items_nodos:
             it = extraer_items(nodo)
-
             cod_iva = it.get("IndFact", "")
-            neto = to_num(it.get("MontoItem"))
-            iva_monto = to_num(it.get("IVAMonto"))
-            cant = to_num(it.get("Cantidad"))
-            precio = to_num(it.get("PrecioUnitario"))
-            desc = it.get("NomItem", "")
-            nro_lin = it.get("NroLinDet", "")
-
-            lineas_archivo.append({
-                "Archivo": nombre_archivo,
-                "Tipo Doc (Carpeta)": tipo_doc,
-                "RUT Company (según carpeta)": rut_company,
-                "Tipo Contabilidad Company": tipo_contab,
-
-                "RUT Emisor": rut_e,
-                "Razón Social": rzn_e,
-                "RUT Receptor": rut_r,
-                "Serie-Nro": f"{serie}-{nro}",
-                "Fch Emisión": fch_e,
-                "Fch Vencimiento": fch_v,
-                "Moneda": moneda,
-                "Línea": nro_lin,
-                "Descripción": desc,
-                "Cant.": cant,
-                "Precio Unit.": precio,
-                "Cod. IVA": cod_iva,
-                "Tasa IVA": traducir_iva(cod_iva),
-                "Neto": neto,
-                "Monto IVA": iva_monto,
-                "Total Línea": neto + iva_monto,
-                "Tipo CFE": tipo_cfe,
-                "Adenda": adenda_final
+            neto, iva_monto = to_num(it.get("MontoItem")), to_num(it.get("IVAMonto"))
+            lineas.append({
+                "Archivo": nombre_archivo, "Tipo Doc (Carpeta)": tipo_doc, "RUT Company (según carpeta)": rut_company,
+                "Tipo Contabilidad Company": tipo_contab, "RUT Emisor": rut_e, "Razón Social": rzn_e, "RUT Receptor": rut_r,
+                "Serie-Nro": f"{serie}-{nro}", "Fch Emisión": fch_e, "Fch Vencimiento": fch_v, "Moneda": moneda,
+                "Línea": it.get("NroLinDet", ""), "Descripción": it.get("NomItem", ""), "Cant.": to_num(it.get("Cantidad")),
+                "Precio Unit.": to_num(it.get("PrecioUnitario")), "Cod. IVA": cod_iva, "Tasa IVA": traducir_iva(cod_iva),
+                "Neto": neto, "Monto IVA": iva_monto, "Total Línea": neto + iva_monto, "Tipo CFE": tipo_cfe, "Adenda": adenda_final
             })
-
-        return lineas_archivo
-
-    except Exception:
-        # Para esta etapa, sin errores detallados: si algo falla, no aporta líneas.
-        return []
-
+        return lineas
+    except: return []
 
 # ----------------------------
 # UI STREAMLIT
 # ----------------------------
-
-st.title("Helios XML Extractor")
-st.write("Subí un archivo ZIP para consolidar tus CFE en Excel, y agregar Tipo de Contabilidad desde Odoo.")
-
-archivo_zip = st.file_uploader("Seleccioná el archivo .ZIP", type=["zip"])
+st.title("Helios XML Extractor & Odoo Sync")
+archivo_zip = st.file_uploader("Subí el ZIP de Helios", type=["zip"])
 
 if archivo_zip:
-    total_data = []
-    ok_count = 0
-    vacios_o_fallidos = 0
-
-    # Opcional: mostrar estado de conexión
     try:
         _ = odoo_clients()
-        st.info("Conexión a Odoo: OK")
+        st.sidebar.success("Conexión Odoo: OK")
     except Exception as e:
-        st.error(f"Conexión a Odoo: FAIL ({e})")
-        st.stop()
+        st.error(f"Error Odoo: {e}"); st.stop()
 
+    total_data = []
     with zipfile.ZipFile(archivo_zip, "r") as z:
-        archivos_xml = [f for f in z.namelist() if f.lower().endswith(".xml")]
-
-        if not archivos_xml:
-            st.error("No se encontraron archivos XML dentro del ZIP.")
-            st.stop()
-
-        for nombre_arc in archivos_xml:
-            with z.open(nombre_arc) as f:
-                contenido = f.read()
-
-            tipo_doc = detectar_tipo_por_ruta(nombre_arc)
-            res = procesar_contenido_xml(contenido, nombre_arc, tipo_doc)
-
-            if res:
-                total_data.extend(res)
-                ok_count += 1
-            else:
-                vacios_o_fallidos += 1
+        xmls = [f for f in z.namelist() if f.lower().endswith(".xml")]
+        for arc in xmls:
+            with z.open(arc) as f:
+                total_data.extend(procesar_contenido_xml(f.read(), arc, detectar_tipo_por_ruta(arc)))
 
     if total_data:
         df = pd.DataFrame(total_data)
+        
+        # --- SECCIÓN DE CRUCE DE PROVEEDORES ---
+        st.header("🔍 Control de Proveedores / Clientes")
+        ruts_detectados = [c for c in df["RUT Company (según carpeta)"].dropna().unique() if c]
+        
+        if ruts_detectados:
+            rut_sel = st.selectbox("Seleccioná la Empresa para validar contra Odoo", ruts_detectados)
+            comp_id = get_company_id_by_vat(rut_sel)
+            
+            if comp_id:
+                with st.spinner("Validando nombres contra Odoo..."):
+                    nombres_odoo = get_odoo_partners(comp_id)
+                    # Tomamos Razon Social de lo que NO sea la propia empresa (si es recibido -> emisor, si emitido -> receptor)
+                    # Simplificado: cruzamos todos los nombres únicos encontrados en el XML
+                    nombres_xml = set(df["Razón Social"].dropna().unique())
+                    faltantes = [n for n in nombres_xml if n.strip().lower() not in nombres_odoo]
 
-        # Nombre dinámico
-        rut_receptor = df["RUT Receptor"].dropna().unique()
-        rut_str = str(rut_receptor[0]) if len(rut_receptor) > 0 else "SIN_RUT"
-
-        df["Fch_DT"] = pd.to_datetime(df["Fch Emisión"], errors="coerce")
-        fmin = df["Fch_DT"].min().strftime("%m%Y") if pd.notnull(df["Fch_DT"].min()) else "ini"
-        fmax = df["Fch_DT"].max().strftime("%m%Y") if pd.notnull(df["Fch_DT"].max()) else "fin"
-        nombre_sugerido = f"ReporteXML_{rut_str}_{fmin}_{fmax}.xlsx"
-        df = df.drop(columns=["Fch_DT"])
-
-        st.success(f"XML con líneas: {ok_count} / {len(archivos_xml)}")
-        if vacios_o_fallidos:
-            st.warning(f"{vacios_o_fallidos} XML no generaron líneas (sin <Item> o formato inesperado).")
-
-        # Preview útil de la nueva columna
-        st.write(
-            df[["Archivo", "Tipo Doc (Carpeta)", "RUT Company (según carpeta)", "Tipo Contabilidad Company"]]
-            .drop_duplicates()
-            .head(20)
-        )
-
-        st.dataframe(df.head())
-        # --- UI: seleccionar company y mostrar plan de cuentas ---
-        companies = (
-            df["RUT Company (según carpeta)"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-        )
-        companies = [c for c in companies.unique().tolist() if c]
-
-        if companies:
-            st.subheader("Plan de cuentas (prueba)")
-            rut_company_sel = st.selectbox("Elegí la empresa (RUT) detectada", companies)
-
-            company_id = get_company_id_by_vat(rut_company_sel)
-            if not company_id:
-                st.warning("No encontré la company en Odoo para ese RUT (res.company.vat).")
-            else:
-                cuentas = get_chart_of_accounts(company_id)
-                if not cuentas:
-                    st.warning("No pude traer cuentas (o no hay cuentas) para esa company.")
+                if faltantes:
+                    st.warning(f"Se detectaron {len(faltantes)} proveedores/clientes que no existen en Odoo (por nombre):")
+                    df_f = pd.DataFrame(faltantes, columns=["Razón Social No Encontrada"])
+                    st.dataframe(df_f, use_container_width=True)
+                    st.download_button("Descargar Faltantes (CSV)", df_f.to_csv(index=False), "faltantes.csv", "text/csv")
                 else:
-                    opciones = [d for d, _code in cuentas]
-                    cuenta_sel = st.selectbox("Elegí una cuenta del plan", opciones)
+                    st.success("✅ Todos los contactos de los XML ya existen en Odoo.")
+            else:
+                st.error("No se encontró el ID de la empresa en Odoo para este RUT.")
 
-            # Si querés ver el code seleccionado:
-                code_sel = cuenta_sel.split(" - ")[0].strip() if " - " in cuenta_sel else cuenta_sel
-                st.caption(f"Seleccionaste: {cuenta_sel}  |  code: {code_sel}  |  company_id: {company_id}")
-        else:
-            st.info("No se detectaron RUT company en los XML (tipo_doc desconocido o falta RUT).")
-
-
-        # Export Excel
+        # --- REPORTE Y EXPORTACIÓN ---
+        st.header("📊 Reporte Consolidado")
+        st.dataframe(df.head())
+        
         output = BytesIO()
-        try:
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False)
-        except Exception:
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False)
-
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False)
+        
         st.download_button(
-            label="Descargar Reporte Excel",
+            label="📥 Descargar Reporte Completo (Excel)",
             data=output.getvalue(),
-            file_name=nombre_sugerido,
+            file_name="Reporte_Helios_Odoo.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.error("No se pudo extraer información válida de los XML.")
-
-
+        st.warning("No se procesaron datos válidos del ZIP.")

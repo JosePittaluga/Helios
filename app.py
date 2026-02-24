@@ -86,7 +86,7 @@ def detectar_tipo_por_ruta(nombre_archivo: str) -> str:
     if "emit" in p: return "emitido"
     return "desconocido"
 
-ddef procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
+def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
     try:
         root = ET.fromstring(contenido)
         # Datos de Cabecera
@@ -207,4 +207,5 @@ if archivo_zip:
         st.download_button("Descargar Reporte Completo", output.getvalue(), "Reporte_Helios.xlsx")
     else:
         st.warning("No se encontraron datos procesables.")
+
 

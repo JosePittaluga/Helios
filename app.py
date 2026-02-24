@@ -40,12 +40,10 @@ def get_company_id_by_vat(vat: str) -> int | None:
 
 @lru_cache(maxsize=128)
 def get_odoo_partners_vat(company_id: int) -> set:
-    """Trae todos los RUTs (vat) de contactos de esa compañía."""
     if not company_id: return set()
     uid, models = odoo_clients()
     domain = ['|', ('company_id', '=', company_id), ('company_id', '=', False)]
     partners = models.execute_kw(DB, uid, PASS, "res.partner", "search_read", [domain], {"fields": ["vat"]})
-    # Limpiamos los ruts para asegurar match (quitar espacios, etc)
     return {str(p["vat"]).strip() for p in partners if p.get("vat")}
 
 # ----------------------------
@@ -89,10 +87,11 @@ def detectar_tipo_por_ruta(nombre_archivo: str) -> str:
 def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
     try:
         root = ET.fromstring(contenido)
-        # Datos de Cabecera
+        # Cabecera
         rut_e = buscar_dato(root, "RUCEmisor")
         rzn_e = buscar_dato(root, "RznSoc")
         rut_r = buscar_dato(root, "DocRecep")
+        rzn_r = buscar_dato(root, "RznSocRecep")
         serie = buscar_dato(root, "Serie")
         nro = buscar_dato(root, "Nro")
         fch_e = buscar_dato(root, "FchEmis")
@@ -101,20 +100,17 @@ def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
         tipo_cfe = buscar_dato(root, "TipoCFE")
         adenda_final = limpiar_adenda(buscar_dato(root, "Adenda"))
 
-        # Identificación de RUT de la compañía (para el filtro de Odoo posterior)
+        # Identificamos la empresa propia para la auditoría
         rut_company = rut_r if tipo_doc == "recibido" else rut_e
 
         items_nodos = [e for e in root.iter() if e.tag.split("}")[-1] == "Item"]
         lineas = []
-        
         for nodo in items_nodos:
             it = extraer_items(nodo)
-            
-            # Cálculos y conversiones
             neto = to_num(it.get("MontoItem"))
             iva_monto = to_num(it.get("IVAMonto"))
-            cod_iva = it.get("IndFact", "") # El Indicador de Facturación suele ser el código de IVA en CFE
-
+            cod_iva = it.get("IndFact", "")
+            
             lineas.append({
                 "Archivo": nombre_archivo,
                 "RUT Emisor": rut_e,
@@ -124,7 +120,7 @@ def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
                 "Fch Emisión": fch_e,
                 "Fch Vencimiento": fch_v,
                 "Moneda": moneda,
-                "Línea": it.get("NroLinDR", ""), # Número de línea
+                "Línea": it.get("NroLinDR", ""),
                 "Descripción": it.get("NomItem", ""),
                 "Cant.": to_num(it.get("Cantidad")),
                 "Precio Unit.": to_num(it.get("PrecioUnitario")),
@@ -135,13 +131,11 @@ def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
                 "Total Línea": neto + iva_monto,
                 "Tipo CFE": tipo_cfe,
                 "Adenda": adenda_final,
-                # Mantenemos este oculto para la lógica interna de Odoo
-                "RUT Company": rut_company,
-                "Tipo Doc": tipo_doc
+                "RUT Company": rut_company, # Oculto para lógica
+                "Nombre Receptor": rzn_r # Oculto para lógica
             })
         return lineas
-    except Exception as e:
-        return []
+    except: return []
 
 # ----------------------------
 # UI STREAMLIT
@@ -166,46 +160,47 @@ if archivo_zip:
     if total_data:
         df = pd.DataFrame(total_data)
         
-        # --- SECCIÓN DE CRUCE POR RUT ---
+        # --- AUDITORÍA DE RUTS ---
         st.header("🔍 Control de Contactos por RUT")
         ruts_propios = [c for c in df["RUT Company"].dropna().unique() if c]
         
         if ruts_propios:
-            rut_sel = st.selectbox("Seleccioná el RUT de la empresa para auditar", ruts_propios)
+            rut_sel = st.selectbox("Seleccioná el RUT de tu empresa para auditar", ruts_propios)
             comp_id = get_company_id_by_vat(rut_sel)
             
             if comp_id:
-                with st.spinner("Comparando RUTs con Odoo..."):
+                with st.spinner("Comparando con Odoo..."):
                     ruts_en_odoo = get_odoo_partners_vat(comp_id)
                     
-                    # Agrupamos por RUT de terceros para no repetir en la lista de faltantes
-                    terceros = df[df["RUT Company"] == rut_sel][["RUT Tercero", "Nombre Tercero", "Tipo Doc"]].drop_duplicates()
+                    # Consolidar terceros (emisores si soy receptor, receptores si soy emisor)
+                    emisores = df[df["RUT Emisor"] != rut_sel][["RUT Emisor", "Razón Social"]].rename(columns={"RUT Emisor": "RUT", "Razón Social": "Nombre"})
+                    receptores = df[df["RUT Receptor"] != rut_sel][["RUT Receptor", "Nombre Receptor"]].rename(columns={"RUT Receptor": "RUT", "Nombre Receptor": "Nombre"})
                     
-                    # Filtramos los que no están en Odoo
-                    faltantes = terceros[~terceros["RUT Tercero"].isin(ruts_en_odoo)]
+                    terceros = pd.concat([emisores, receptores]).drop_duplicates(subset=["RUT"])
+                    faltantes = terceros[(~terceros["RUT"].isin(ruts_en_odoo)) & (terceros["RUT"] != "")]
 
                 if not faltantes.empty:
-                    st.warning(f"Se encontraron {len(faltantes)} RUTs en los XML que NO existen en Odoo:")
+                    st.warning(f"Se encontraron {len(faltantes)} RUTs que NO existen en Odoo:")
                     st.dataframe(faltantes, use_container_width=True)
-                    
-                    # Excel de faltantes
                     buf = BytesIO()
                     faltantes.to_excel(buf, index=False)
-                    st.download_button("Descargar RUTs Faltantes (Excel)", buf.getvalue(), "ruts_no_en_odoo.xlsx")
+                    st.download_button("Descargar RUTs Faltantes", buf.getvalue(), "faltantes_odoo.xlsx")
                 else:
-                    st.success("✅ Todos los emisores/receptores de los XML existen en Odoo.")
-            else:
-                st.error("No se encontró la empresa seleccionada en Odoo.")
+                    st.success("✅ Todos los contactos ya existen en Odoo.")
 
-        # --- REPORTE GENERAL ---
+        # --- REPORTE DETALLADO ---
         st.header("📊 Reporte Detallado")
-        st.dataframe(df)
+        # Columnas finales según tu imagen
+        cols_finales = ["Archivo", "RUT Emisor", "Razón Social", "RUT Receptor", "Serie-Nro", 
+                        "Fch Emisión", "Fch Vencimiento", "Moneda", "Línea", "Descripción", 
+                        "Cant.", "Precio Unit.", "Cod. IVA", "Tasa IVA", "Neto", "Monto IVA", 
+                        "Total Línea", "Tipo CFE", "Adenda"]
+        
+        st.dataframe(df[cols_finales])
         
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False)
+            df[cols_finales].to_excel(writer, index=False)
         st.download_button("Descargar Reporte Completo", output.getvalue(), "Reporte_Helios.xlsx")
     else:
-        st.warning("No se encontraron datos procesables.")
-
-
+        st.warning("No se encontraron datos.")

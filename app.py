@@ -86,40 +86,62 @@ def detectar_tipo_por_ruta(nombre_archivo: str) -> str:
     if "emit" in p: return "emitido"
     return "desconocido"
 
-def procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
+ddef procesar_contenido_xml(contenido, nombre_archivo, tipo_doc):
     try:
         root = ET.fromstring(contenido)
-        rut_e, rzn_e = buscar_dato(root, "RUCEmisor"), buscar_dato(root, "RznSoc")
-        rut_r, rzn_r = buscar_dato(root, "DocRecep"), buscar_dato(root, "RznSocRecep")
-        serie, nro = buscar_dato(root, "Serie"), buscar_dato(root, "Nro")
-        fch_e, fch_v, moneda = buscar_dato(root, "FchEmis"), buscar_dato(root, "FchVenc"), buscar_dato(root, "TpoMoneda")
-        tipo_cfe, adenda_final = buscar_dato(root, "TipoCFE"), limpiar_adenda(buscar_dato(root, "Adenda"))
+        # Datos de Cabecera
+        rut_e = buscar_dato(root, "RUCEmisor")
+        rzn_e = buscar_dato(root, "RznSoc")
+        rut_r = buscar_dato(root, "DocRecep")
+        serie = buscar_dato(root, "Serie")
+        nro = buscar_dato(root, "Nro")
+        fch_e = buscar_dato(root, "FchEmis")
+        fch_v = buscar_dato(root, "FchVenc")
+        moneda = buscar_dato(root, "TpoMoneda")
+        tipo_cfe = buscar_dato(root, "TipoCFE")
+        adenda_final = limpiar_adenda(buscar_dato(root, "Adenda"))
 
-        # Identificamos quién es el 'tercero' según si es emitido o recibido
-        if tipo_doc == "recibido":
-            tercero_rut = rut_e
-            tercero_nombre = rzn_e
-            rut_company = rut_r
-        elif tipo_doc == "emitido":
-            tercero_rut = rut_r
-            tercero_nombre = rzn_r
-            rut_company = rut_e
-        else:
-            tercero_rut, tercero_nombre, rut_company = "", "", ""
+        # Identificación de RUT de la compañía (para el filtro de Odoo posterior)
+        rut_company = rut_r if tipo_doc == "recibido" else rut_e
 
         items_nodos = [e for e in root.iter() if e.tag.split("}")[-1] == "Item"]
         lineas = []
+        
         for nodo in items_nodos:
             it = extraer_items(nodo)
-            neto, iva_monto = to_num(it.get("MontoItem")), to_num(it.get("IVAMonto"))
+            
+            # Cálculos y conversiones
+            neto = to_num(it.get("MontoItem"))
+            iva_monto = to_num(it.get("IVAMonto"))
+            cod_iva = it.get("IndFact", "") # El Indicador de Facturación suele ser el código de IVA en CFE
+
             lineas.append({
-                "Archivo": nombre_archivo, "Tipo Doc": tipo_doc, "RUT Company": rut_company,
-                "RUT Tercero": tercero_rut, "Nombre Tercero": tercero_nombre,
-                "Serie-Nro": f"{serie}-{nro}", "Fch Emisión": fch_e, "Moneda": moneda,
-                "Descripción": it.get("NomItem", ""), "Neto": neto, "Monto IVA": iva_monto, "Total Línea": neto + iva_monto
+                "Archivo": nombre_archivo,
+                "RUT Emisor": rut_e,
+                "Razón Social": rzn_e,
+                "RUT Receptor": rut_r,
+                "Serie-Nro": f"{serie}-{nro}",
+                "Fch Emisión": fch_e,
+                "Fch Vencimiento": fch_v,
+                "Moneda": moneda,
+                "Línea": it.get("NroLinDR", ""), # Número de línea
+                "Descripción": it.get("NomItem", ""),
+                "Cant.": to_num(it.get("Cantidad")),
+                "Precio Unit.": to_num(it.get("PrecioUnitario")),
+                "Cod. IVA": cod_iva,
+                "Tasa IVA": traducir_iva(cod_iva),
+                "Neto": neto,
+                "Monto IVA": iva_monto,
+                "Total Línea": neto + iva_monto,
+                "Tipo CFE": tipo_cfe,
+                "Adenda": adenda_final,
+                # Mantenemos este oculto para la lógica interna de Odoo
+                "RUT Company": rut_company,
+                "Tipo Doc": tipo_doc
             })
         return lineas
-    except: return []
+    except Exception as e:
+        return []
 
 # ----------------------------
 # UI STREAMLIT
@@ -185,3 +207,4 @@ if archivo_zip:
         st.download_button("Descargar Reporte Completo", output.getvalue(), "Reporte_Helios.xlsx")
     else:
         st.warning("No se encontraron datos procesables.")
+
